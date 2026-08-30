@@ -59,6 +59,54 @@ def _call_key(c):
     return json.dumps({"name": c.get("name"), "arguments": c.get("arguments")}, sort_keys=True)
 
 
+def _token_f1(a, b):
+    """Token-level F1 between two strings, normalized (lowercase, punctuation stripped)."""
+    import re as _re
+    ta = _re.sub(r"[^\w\s]", "", str(a).lower()).split()
+    tb = _re.sub(r"[^\w\s]", "", str(b).lower()).split()
+    if not ta or not tb:
+        return 1.0 if ta == tb else 0.0
+    common = {}
+    for t in ta:
+        common[t] = common.get(t, 0) + 1
+    overlap = 0
+    for t in tb:
+        if common.get(t, 0) > 0:
+            overlap += 1
+            common[t] -= 1
+    if overlap == 0:
+        return 0.0
+    p = overlap / len(tb)
+    r = overlap / len(ta)
+    return 2 * p * r / (p + r)
+
+
+def _args_match_soft(pred_args, ref_args, f1_threshold=0.6):
+    """TK-4694 (LTSSS): argument match where FREE-TEXT values score by token F1.
+
+    Exact match prices 'Our webhook integration' vs 'our webhook integration' — a one-capital
+    difference — identically to a wrong tool. Both corpus-side fixes were tested and falsified
+    (more data: 6/10 unchanged; extractive rewrite: went 5/10 -> 4/10 on boundary/case ambiguity),
+    which is what makes the METRIC the defensible lever. Discrimination is preserved where it
+    matters: a value with no whitespace (ids, datetimes, enums like priority) still requires an
+    EXACT match — 'urgent' vs 'urgent_important' stays a failure. Only multi-word free text
+    (titles, messages, descriptions) is scored by token F1 >= threshold. Key sets must be equal:
+    a missing or extra argument is a mismatch, never partial credit.
+    """
+    pred_args = pred_args or {}
+    ref_args = ref_args or {}
+    if set(pred_args.keys()) != set(ref_args.keys()):
+        return False
+    for k, rv in ref_args.items():
+        pv = pred_args[k]
+        if isinstance(rv, str) and isinstance(pv, str) and (" " in rv.strip() or " " in pv.strip()):
+            if _token_f1(pv, rv) < f1_threshold:
+                return False
+        elif pv != rv:
+            return False
+    return True
+
+
 def _quick_tool_eval(model, params, tokenizer, examples, max_gen_len=512, max_enc_len=1024):
     """Tool-call eval matching needle's F1 methodology (TP/FP/FN)."""
     from ..model.run import generate_batch
@@ -85,6 +133,8 @@ def _quick_tool_eval(model, params, tokenizer, examples, max_gen_len=512, max_en
     call_tp, call_fp, call_fn = 0, 0, 0
     args_correct, args_total = 0, 0
     per_tool = {}
+    per_tool_soft = {}
+    call_tp_soft, call_fp_soft, call_fn_soft = 0, 0, 0
 
     for ex, pred_text in zip(samples, all_preds):
         pred_text = pred_text.strip()
@@ -143,6 +193,36 @@ def _quick_tool_eval(model, params, tokenizer, examples, max_gen_len=512, max_en
                         per_tool[rname]["correct"] += 1
                         break
 
+        # soft pass (TK-4694): same structure, free-text args by token F1. Strict stays above —
+        # every historical number keeps meaning; the soft row answers "was it semantically right".
+        for c in ref_calls:
+            if not isinstance(c, dict) or "name" not in c:
+                continue
+            rname = c["name"]
+            if rname not in per_tool_soft:
+                per_tool_soft[rname] = {"correct": 0, "total": 0}
+            per_tool_soft[rname]["total"] += 1
+            for pc in pred_calls:
+                if isinstance(pc, dict) and pc.get("name") == rname:
+                    if _args_match_soft(pc.get("arguments", {}), c.get("arguments", {})):
+                        per_tool_soft[rname]["correct"] += 1
+                        break
+        matched_ref = set()
+        for pc in pred_calls:
+            if not isinstance(pc, dict) or "name" not in pc:
+                continue
+            hit = False
+            for i2, rc in enumerate(ref_calls):
+                if i2 in matched_ref or not isinstance(rc, dict):
+                    continue
+                if rc.get("name") == pc.get("name") and _args_match_soft(pc.get("arguments", {}), rc.get("arguments", {})):
+                    matched_ref.add(i2); hit = True; break
+            if hit:
+                call_tp_soft += 1
+            else:
+                call_fp_soft += 1
+        call_fn_soft += sum(1 for i2, rc in enumerate(ref_calls) if isinstance(rc, dict) and i2 not in matched_ref)
+
     name_p = name_tp + name_fp
     name_r = name_tp + name_fn
     call_p = call_tp + call_fp
@@ -156,6 +236,8 @@ def _quick_tool_eval(model, params, tokenizer, examples, max_gen_len=512, max_en
         "args_acc": round(args_correct / max(args_total, 1), 4),
         "n": n,
         "per_tool": per_tool,
+        "call_f1_soft": round(2 * call_tp_soft / max((call_tp_soft + call_fp_soft) + (call_tp_soft + call_fn_soft), 1), 4),
+        "per_tool_soft": per_tool_soft,
     }
 
 
